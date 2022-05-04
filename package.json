@@ -1,0 +1,15 @@
+{
+  "name": "telegram-wallet-contracts",
+  "version": "1.0.0",
+  "author": "Andrii Matskiv",
+  "license": "MIT",
+  "private": "true",
+  "dependencies": {
+    "@openzeppelin/contracts": "^4.6.0",
+    "@openzeppelin/test-helpers": "^0.5.15",
+    "@truffle/hdwallet-provider": "^1.4.3",
+    "dotenv": "^10.0.0",
+    "truffle-plugin-verify": "^0.5.15",
+    "web3-utils": "^1.6.0"
+  }
+}

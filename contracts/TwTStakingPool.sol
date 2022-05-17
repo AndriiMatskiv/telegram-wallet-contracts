@@ -2,13 +2,21 @@
 pragma solidity ^0.8.3;
 
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
-import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/access/AccessControl.sol";
 import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/utils/math/Math.sol";
+import "@openzeppelin/contracts/utils/math/SafeMath.sol";
 
 //IN PROGRESS
-contract TwtStakingPool is Ownable, ReentrancyGuard {
+contract TwtStakingPool is AccessControl, ReentrancyGuard {
+  bytes32 public constant BURNER_ROLE = keccak256("BURNER_ROLE");
+  bytes32 public constant MINTER_ROLE = keccak256("MINTER_ROLE");
+  
+  uint256 public constant BONUS_DECIMALS = 10000;
+  uint256 public constant REWARD_DECIMALS = 100000;
+
   using SafeERC20 for IERC20;
+  using SafeMath for uint256;
 
   struct PoolInfo {
     IERC20 token;
@@ -17,149 +25,209 @@ contract TwtStakingPool is Ownable, ReentrancyGuard {
     uint256 maxBonus;
     uint256 bonusDuration;
     uint256 bonusRate;
+    bool active;
   }
-
-  uint256 public bonusDecimals;
-  uint256 public rewardDecimals;
 
   struct UserInfo {
     uint256 staked;
-    uint256 balance;
     uint256 lastBonus;
     uint256 lastUpdated;
   }
 
+  uint256 priceByEth;
+
   PoolInfo[] public poolInfo;
   mapping (uint256 => mapping (address => UserInfo)) public userInfo;
-
-  uint256 public totalSupply;
-
-  IERC20 public twtToken;
+  mapping (address => uint256) public balances;
 
   event EthWithdrawn(uint256 amount);
+  event PointsMinted(address owner, uint256 amount);
+  event PointsBurned(address owner, uint256 amount);
+  event PointsBought(address owner, uint256 amount);
+  event PointsPriceSet(uint256 price);
 
-  event RewardSet(uint256 rewardRate, uint256 minRewardStake);
-  event BonusesSet(uint256 maxBonus, uint256 bonusDuration);
-  event TwtTokenSet(address token);
-  event RateToEthSet(uint256 rateToEth);
+  event PoolInfoSet(uint256 poolId, uint256 rewardRate, uint256 minRewardStake, uint256 maxBonus, uint256 bonusDuration, uint256 bonusRate);
+  event PoolAdded(uint256 poolId, uint256 rewardRate, uint256 minRewardStake, uint256 maxBonus, uint256 bonusDuration, uint256 bonusRate);
 
-  event TokensStaked(address payer, uint256 amount, uint256 timestamp);
-  event TokensWithdrawn(address owner, uint256 amount, uint256 timestamp);
+  event TokensStaked(uint256 poolId, address payer, uint256 amount, uint256 timestamp);
+  event TokensWithdrawn(uint256 poolId, address owner, uint256 amount, uint256 timestamp);
 
-  constructor(address twtToken_) {
-    require(twtToken_ != address(0), "TwtStakingPool: twtToken is zero address");
-    twtToken = IERC20(twtToken_);
+  constructor(uint256 _priceByEth) {
+    _setupRole(DEFAULT_ADMIN_ROLE, _msgSender());
+    priceByEth = _priceByEth;
   }
-  
-  modifier balanceUpdate(uint256 pId, address _owner) {
-    uint256 duration = block.timestamp.sub(lastUpdated[_owner]);
-    uint256 reward = calculateReward(_owner, staked[_owner], duration);
-    
-    balances[_owner] = balances[_owner].add(reward);
-    lastUpdated[_owner] = block.timestamp;
-    lastBonus[_owner] = Math.min(maxBonus, lastBonus[_owner].add(bonusRate.mul(duration)));
+
+  modifier onlyOwner() {
+    require(hasRole(DEFAULT_ADMIN_ROLE, _msgSender()), "TwtStakingPool: caller is not an owner");
     _;
   }
 
-  function getRewardByDuration(address _owner, uint256 _amount, uint256 _duration) 
-    public view returns(uint256) {
-      return calculateReward(_owner, _amount, _duration);
+  modifier onlyBurner() {
+    require(hasRole(BURNER_ROLE, _msgSender()), "TwtStakingPool: caller is not a burner");
+    _;
   }
 
-  function getStaked(address _owner) 
-    public view returns(uint256) {
-      return staked[_owner];
+  modifier onlyMinter() {
+    require(hasRole(MINTER_ROLE, _msgSender()), "TwtStakingPool: caller is not a minter");
+    _;
   }
   
-  function balanceOf(address _owner)
-    public view returns(uint256) {
-      uint256 reward = calculateReward(_owner, staked[_owner], block.timestamp.sub(lastUpdated[_owner]));
-      return balances[_owner].add(reward);
+  modifier balanceUpdate(address _owner, uint256 _pId) {
+    uint256 duration = block.timestamp.sub(userInfo[_pId][_owner].lastUpdated);
+    uint256 reward = calculateReward(_owner, _pId, userInfo[_pId][_owner].staked, duration);
+    
+    balances[_owner] = balances[_owner].add(reward);
+    userInfo[_pId][_owner].lastUpdated = block.timestamp;
+    userInfo[_pId][_owner].lastBonus = Math.min(
+      poolInfo[_pId].maxBonus, 
+      userInfo[_pId][_owner].lastBonus.add(poolInfo[_pId].bonusRate.mul(duration))
+    );
+    _;
   }
 
-  function getCurrentBonus(address _owner) 
-    public view returns(uint256) {
-      if(staked[_owner] == 0) {
-        return 0;
-      } 
-      uint256 duration = block.timestamp.sub(lastUpdated[_owner]);
-      return Math.min(maxBonus, lastBonus[_owner].add(bonusRate.mul(duration)));
+  function poolLength() public view returns(uint256) {
+    return poolInfo.length;
   }
 
-  function getCurrentAvgBonus(address _owner, uint256 _duration)
-    public view returns(uint256) {
-      if(staked[_owner] == 0) {
-        return 0;
-      } 
-      uint256 avgBonus;
-      if(lastBonus[_owner] < maxBonus) {
-        uint256 durationTillMax = maxBonus.sub(lastBonus[_owner]).div(bonusRate);
-        if(_duration > durationTillMax) {
-          uint256 avgWeightedBonusTillMax = lastBonus[_owner].add(maxBonus).div(2).mul(durationTillMax);
-          uint256 weightedMaxBonus = maxBonus.mul(_duration.sub(durationTillMax));
+  function getRewardByDuration(address _owner, uint256 _pId, uint256 _amount, uint256 _duration) public view returns(uint256) {
+    return calculateReward(_owner, _pId, _amount, _duration);
+  }
 
-          avgBonus = avgWeightedBonusTillMax.add(weightedMaxBonus).div(_duration);
-        } else {
-          avgBonus = lastBonus[_owner].add(bonusRate.mul(_duration)).add(lastBonus[_owner]).div(2);
-        }
+  function getStaked(address _owner, uint256 _pId) public view returns(uint256) {
+    return userInfo[_pId][_owner].staked;
+  }
+  
+  function balanceOf(address _owner, uint256 _pId) public view returns(uint256) {
+    uint256 totalNewReward;
+
+    for (uint256 i; i < poolLength(); i++) {
+      totalNewReward = totalNewReward.add(calculateReward(_owner, _pId, userInfo[_pId][_owner].staked, block.timestamp.sub(userInfo[_pId][_owner].lastUpdated)));
+    }   
+
+    return balances[_owner].add(totalNewReward);
+  }
+
+  function getCurrentBonus(address _owner, uint256 _pId) public view returns(uint256) {
+    if(userInfo[_pId][_owner].staked == 0) {
+      return 0;
+    } 
+ 
+    uint256 duration = block.timestamp.sub(userInfo[_pId][_owner].lastUpdated);
+    return Math.min(poolInfo[_pId].maxBonus, userInfo[_pId][_owner].lastBonus.add(poolInfo[_pId].bonusRate.mul(duration)));
+  }
+
+  function getCurrentAvgBonus(address _owner, uint256 _pId, uint256 _duration) public view returns(uint256) {
+    if (userInfo[_pId][_owner].staked == 0) {
+      return 0;
+    } 
+
+    uint256 avgBonus;
+    if(userInfo[_pId][_owner].lastBonus < poolInfo[_pId].maxBonus) {
+      uint256 durationTillMax = poolInfo[_pId].maxBonus.sub(userInfo[_pId][_owner].lastBonus).div(poolInfo[_pId].bonusRate);
+      if(_duration > durationTillMax) {
+        uint256 avgWeightedBonusTillMax = userInfo[_pId][_owner].lastBonus.add(poolInfo[_pId].maxBonus).div(2).mul(durationTillMax);
+        uint256 weightedMaxBonus = poolInfo[_pId].maxBonus.mul(_duration.sub(durationTillMax));
+
+        avgBonus = avgWeightedBonusTillMax.add(weightedMaxBonus).div(_duration);
       } else {
-        avgBonus = maxBonus;
+        avgBonus = userInfo[_pId][_owner].lastBonus.add(poolInfo[_pId].bonusRate.mul(_duration)).add(userInfo[_pId][_owner].lastBonus).div(2);
       }
-      return avgBonus;
+    } else {
+      avgBonus = poolInfo[_pId].maxBonus;
+    }
+
+    return avgBonus;
   }
 
-  function setReward(uint256 _rewardRate, uint256 _minRewardStake)
-    external onlyOwner {
-      rewardRate = _rewardRate;
-      minRewardStake = _minRewardStake;
+  function setPoolInfo(uint256 _pId, uint256 _rewardRate, uint256 _minRewardStake, uint256 _maxBonus, uint256 _bonusDuration, uint256 _bonusRate)  external onlyOwner {
+    poolInfo[_pId].rewardRate = _rewardRate;
+    poolInfo[_pId].minRewardStake = _minRewardStake;
+    poolInfo[_pId].maxBonus = _maxBonus;
+    poolInfo[_pId].bonusDuration = _bonusDuration;
+    poolInfo[_pId].bonusRate = _bonusRate;
 
-      emit RewardSet(rewardRate, minRewardStake);
+    emit PoolInfoSet(_pId, _rewardRate, _minRewardStake, _maxBonus, _bonusDuration, _bonusRate);
   }
 
-  function setBonus(uint256 _maxBonus, uint256 _bonusDuration)
-    external onlyOwner {
-      maxBonus = _maxBonus.mul(bonusDecimals);
-      bonusDuration = _bonusDuration;
-      bonusRate = maxBonus.div(_bonusDuration);
+  function addPool(address _token, uint256 _rewardRate, uint256 _minRewardStake, uint256 _maxBonus, uint256 _bonusDuration, uint256 _bonusRate) external onlyOwner {
+    poolInfo.push(PoolInfo({
+      token: IERC20(_token),
+      rewardRate: _rewardRate,
+      minRewardStake: _minRewardStake,
+      maxBonus: _maxBonus,
+      bonusDuration: _bonusDuration,
+      bonusRate: _bonusRate,
+      active: true
+    }));
 
-      emit BonusesSet(_maxBonus, _bonusDuration);
+    emit PoolAdded(poolLength(), _rewardRate, _minRewardStake, _maxBonus, _bonusDuration, _bonusRate);
+  }
+
+  function setPoolState(uint256 _pId, bool _state) external onlyOwner {
+    poolInfo[_pId].active = _state;
+  }
+
+  function setPrice(uint256 _priceByEth) external onlyOwner {
+    priceByEth = _priceByEth;
+    emit PointsPriceSet(_priceByEth);
   }
   
-  function stake(uint256 _amount)
-    external nonReentrant balanceUpdate(_msgSender()) {
-      require(_amount > 0, "TwtStakingPool: _amount is 0");
+  function stake(uint256 _amount, uint256 _pId) external nonReentrant balanceUpdate(_msgSender(), _pId) {
+    require(_amount > 0, "TwtStakingPool: _amount is 0");
+    require(poolInfo[_pId].active, "TwtStakingPool: pool inactive");
 
-      twtToken.safeTransferFrom(_msgSender(), address(this), _amount);
+    poolInfo[_pId].token.safeTransferFrom(_msgSender(), address(this), _amount);
 
-      totalSupply = totalSupply.add(_amount);      
-      uint256 currentStake = staked[_msgSender()];
-      staked[_msgSender()] = staked[_msgSender()].add(_amount);
-      lastBonus[_msgSender()] = lastBonus[_msgSender()].mul(currentStake).div(staked[_msgSender()]);
+    uint256 currentStake = userInfo[_pId][_msgSender()].staked;
+    userInfo[_pId][_msgSender()].staked = userInfo[_pId][_msgSender()].staked.add(_amount);
+    userInfo[_pId][_msgSender()].lastBonus = userInfo[_pId][_msgSender()].lastBonus.mul(currentStake).div(userInfo[_pId][_msgSender()].staked);
 
-      emit TokensStaked(_msgSender(), _amount, block.timestamp);
+    emit TokensStaked(_pId, _msgSender(), _amount, block.timestamp);
   }
   
-  function withdraw(uint256 _amount)
-    external nonReentrant balanceUpdate(_msgSender()) {
-      staked[_msgSender()] = staked[_msgSender()].sub(_amount);
-      totalSupply = totalSupply.sub(_amount);
+  function withdraw(uint256 _amount, uint256 _pId) external nonReentrant balanceUpdate(_msgSender(), _pId) {
+    userInfo[_pId][_msgSender()].staked = userInfo[_pId][_msgSender()].staked.sub(_amount);
+    poolInfo[_pId].token.safeTransfer(_msgSender(), _amount);
 
-      twtToken.safeTransfer(_msgSender(), _amount);
-      
-      emit TokensWithdrawn(_msgSender(), _amount, block.timestamp);
+    emit TokensWithdrawn(_pId, _msgSender(), _amount, block.timestamp);
   }
 
-  function withdrawEth(uint256 _amount)
-    external onlyOwner {
-      require(_amount <= address(this).balance, "TwtStakingPool: not enough balance");
-      (bool success, ) = _msgSender().call{ value: _amount }("");
-      require(success, "TwtStakingPool: transfer failed");
-      emit EthWithdrawn(_amount);
+  function withdrawEth(uint256 _amount) external onlyOwner {
+    require(_amount <= address(this).balance, "TwtStakingPool: not enough balance");
+    (bool success, ) = _msgSender().call{ value: _amount }("");
+    require(success, "TwtStakingPool: transfer failed");
+
+    emit EthWithdrawn(_amount);
   }
 
-  function calculateBonus(address _owner, uint256 _amount, uint256 _duration)
-    private view returns(uint256) {
-      uint256 avgBonus = getCurrentAvgBonus(_owner, _duration);
-      return _amount.add(_amount.mul(avgBonus).div(bonusDecimals).div(100));
+  function calculateReward(address _owner, uint256 _pId, uint256 _amount, uint256 _duration) private view returns(uint256) {
+    uint256 reward = _duration.mul(poolInfo[_pId].rewardRate)
+      .mul(_amount)
+      .div(REWARD_DECIMALS)
+      .div(poolInfo[_pId].minRewardStake);
+
+    return calculateBonus(_owner, _pId, reward, _duration);
+  }
+
+  function calculateBonus(address _owner, uint256 _pId, uint256 _amount, uint256 _duration) private view returns(uint256) {
+    uint256 avgBonus = getCurrentAvgBonus(_owner, _pId, _duration);
+    return _amount.add(_amount.mul(avgBonus).div(BONUS_DECIMALS).div(100));
+  }
+
+  function buyPoints() external payable nonReentrant {
+    uint256 amount = msg.value * priceByEth;
+    balances[_msgSender()] = balances[_msgSender()].add(amount);
+
+    emit PointsBought(_msgSender(), amount);
+  }
+
+  function mint(address _owner, uint256 _amount) external nonReentrant onlyMinter {
+    balances[_owner] = balances[_owner].add(_amount);
+    emit PointsMinted(_owner, _amount);
+  }
+
+  function burn(address _owner, uint256 _amount) external nonReentrant onlyBurner {
+    balances[_owner] = balances[_owner].sub(_amount);
+    emit PointsBurned(_owner, _amount);
   }
 }

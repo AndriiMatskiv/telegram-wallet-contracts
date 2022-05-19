@@ -11,8 +11,7 @@ contract TwtStakingPool is AccessControl, ReentrancyGuard {
   bytes32 public constant BURNER_ROLE = keccak256("BURNER_ROLE");
   bytes32 public constant MINTER_ROLE = keccak256("MINTER_ROLE");
   
-  uint256 public constant BONUS_DECIMALS = 10000;
-  uint256 public constant REWARD_DECIMALS = 100000;
+  uint256 public constant DECIMALS = 100000;
 
   using SafeERC20 for IERC20;
   using SafeMath for uint256;
@@ -33,11 +32,11 @@ contract TwtStakingPool is AccessControl, ReentrancyGuard {
     uint256 lastUpdated;
   }
 
-  uint256 priceByEth;
+  uint256 public priceByEth;
 
   PoolInfo[] public poolInfo;
-  mapping (uint256 => mapping (address => UserInfo)) public userInfo;
-  mapping (address => uint256) public balances;
+  mapping (uint256 => mapping (address => UserInfo)) internal userInfo;
+  mapping (address => uint256) internal balances;
 
   event EthWithdrawn(uint256 amount);
   event PointsMinted(address owner, uint256 amount);
@@ -202,7 +201,7 @@ contract TwtStakingPool is AccessControl, ReentrancyGuard {
   function calculateReward(address _owner, uint256 _pId, uint256 _amount, uint256 _duration) private view returns(uint256) {
     uint256 reward = _duration.mul(poolInfo[_pId].rewardRate)
       .mul(_amount)
-      .div(REWARD_DECIMALS)
+      .div(DECIMALS)
       .div(poolInfo[_pId].minRewardStake);
 
     return calculateBonus(_owner, _pId, reward, _duration);
@@ -210,7 +209,7 @@ contract TwtStakingPool is AccessControl, ReentrancyGuard {
 
   function calculateBonus(address _owner, uint256 _pId, uint256 _amount, uint256 _duration) private view returns(uint256) {
     uint256 avgBonus = getCurrentAvgBonus(_owner, _pId, _duration);
-    return _amount.add(_amount.mul(avgBonus).div(BONUS_DECIMALS).div(100));
+    return _amount.add(_amount.mul(avgBonus).div(DECIMALS).div(100));
   }
 
   function buyPoints() external payable nonReentrant {
